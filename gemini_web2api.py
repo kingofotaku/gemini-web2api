@@ -63,7 +63,7 @@ DEFAULT_CONFIG = {
     "cookie_file": None,
     "proxy": None,
     "api_keys": [],
-    "temporary_chats": True,
+    "temporary_chats": False,
     "persistent_chat": False,
 }
 
