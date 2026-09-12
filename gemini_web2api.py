@@ -166,7 +166,17 @@ def _next_reqid() -> int:
         _REQID_NEXT += 100000
         return _REQID_NEXT
 
-CONFIG = dict(DEFAULT_CONFIG)
+try:
+    # Share the modular package's CONFIG object. Code paths that call into
+    # gemini_web2api.multimodal / gemini_web2api.gemini read the package
+    # copy of CONFIG; without this alias the single-file server would
+    # configure only its own dict and the package modules would see
+    # defaults (no proxy, no cookie file) instead.
+    from gemini_web2api.config import CONFIG as _PKG_CONFIG
+    _PKG_CONFIG.update(DEFAULT_CONFIG)
+    CONFIG = _PKG_CONFIG
+except ImportError:
+    CONFIG = dict(DEFAULT_CONFIG)
 
 # ─── Models ──────────────────────────────────────────────────────────────────
 # Mapping from JS source: MODE_CATEGORY enum (028-6eb337387583.js)
