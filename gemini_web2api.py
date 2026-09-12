@@ -31,6 +31,8 @@ import re
 import os
 import hashlib
 import argparse
+import random
+import threading
 import base64
 import binascii
 from typing import Optional
@@ -149,6 +151,20 @@ class ChatWindow:
 
 
 CHAT_WINDOW = ChatWindow()
+
+# Browser-like per-session RPC counter. The real Gemini web app sends an
+# ever-increasing _reqid (+100000 per RPC) for every request in a page
+# session. Deriving it from a timestamp made concurrent requests (e.g. a
+# cronjob firing while the user is chatting) send identical ids.
+_REQID_LOCK = threading.Lock()
+_REQID_NEXT = random.randrange(10000, 99999)
+
+
+def _next_reqid() -> int:
+    global _REQID_NEXT
+    with _REQID_LOCK:
+        _REQID_NEXT += 100000
+        return _REQID_NEXT
 
 CONFIG = dict(DEFAULT_CONFIG)
 
@@ -513,7 +529,7 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
         if CONFIG.get("xsrf_token"):
             params["at"] = CONFIG["xsrf_token"]
         body = urllib.parse.urlencode(params).encode()
-        reqid = int(time.time()) % 1000000
+        reqid = _next_reqid()
         prefix = account_prefix()
         url = (
             f"https://gemini.google.com{prefix}/_/BardChatUi/data/"
@@ -613,7 +629,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
         if CONFIG.get("xsrf_token"):
             params["at"] = CONFIG["xsrf_token"]
         body = urllib.parse.urlencode(params)
-        reqid = int(time.time()) % 1000000
+        reqid = _next_reqid()
         prefix = account_prefix()
         url = (
             f"https://gemini.google.com{prefix}/_/BardChatUi/data/"

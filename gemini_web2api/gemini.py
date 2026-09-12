@@ -4,9 +4,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
 import re
 import secrets
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -28,6 +30,20 @@ except ImportError:
 
 from .config import CONFIG
 from .generated_image import GenerationResult, extract_generation_result
+
+# Browser-like per-session RPC counter. The real Gemini web app sends an
+# ever-increasing _reqid (+100000 per RPC) for every request in a page
+# session. Deriving it from a timestamp made concurrent requests (e.g. a
+# cronjob firing while the user is chatting) send identical ids.
+_REQID_LOCK = threading.Lock()
+_REQID_NEXT = random.randrange(10000, 99999)
+
+
+def _next_reqid() -> int:
+    global _REQID_NEXT
+    with _REQID_LOCK:
+        _REQID_NEXT += 100000
+        return _REQID_NEXT
 
 _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0, "size": -1}
@@ -326,7 +342,7 @@ def _build_image_payload(prompt: str, request_uuid: str, xsrf_token: str = None)
 
 
 def _get_url(session_id: str = None) -> str:
-    reqid = int(time.time()) % 1000000
+    reqid = _next_reqid()
     account_prefix = _account_prefix()
     params = {
         "bl": CONFIG["gemini_bl"],
@@ -577,7 +593,7 @@ def get_full_size_image(image) -> str | None:
         ]
         rpc = ["c8o8Fe", json.dumps(payload), None, "generic"]
         params = {
-            "rpcids": "c8o8Fe", "hl": "en", "_reqid": int(time.time()) % 1000000,
+            "rpcids": "c8o8Fe", "hl": "en", "_reqid": _next_reqid(),
             "rt": "c", "source-path": f"{_account_prefix()}/app/{image.cid}",
             "bl": CONFIG["gemini_bl"],
         }
