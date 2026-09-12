@@ -501,14 +501,25 @@ def upload_images(images: list) -> list:
     return file_refs if file_refs else None
 
 
+def _normalise_file_ref(file_ref) -> list:
+    """Convert legacy refs and ``(ref, filename)`` pairs to Gemini's file shape."""
+    if isinstance(file_ref, (tuple, list)) and len(file_ref) == 2:
+        ref, filename = file_ref
+    else:
+        ref, filename = file_ref, "image.png"
+    if not isinstance(ref, str) or not ref:
+        raise ValueError("invalid uploaded file reference")
+    return [[ref], filename or "image.png"]
+
+
 # ─── Gemini Protocol ─────────────────────────────────────────────────────────
 
 def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None,
                            extra_fields: dict = None, model_name: str = None) -> str:
     """Send prompt to Gemini StreamGenerate with retry."""
-    inner = [None] * 102
+    inner = [None] * (81 if file_refs else 102)
     if file_refs:
-        refs = [[None, None, ref] for ref in file_refs]
+        refs = [_normalise_file_ref(ref) for ref in file_refs]
         inner[0] = [prompt, 0, None, refs, None, None, 0]
     else:
         inner[0] = [prompt, 0, None, None, None, None, 0]
@@ -528,6 +539,8 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
     inner[61] = []
     inner[68] = 1
     inner[79] = model_id
+    if file_refs:
+        inner[80] = 1
     if extra_fields:
         for k, v in extra_fields.items():
             inner[k] = v
@@ -607,9 +620,9 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
 def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, file_refs: list = None,
                                 extra_fields: dict = None, model_name: str = None):
     """Send prompt and yield incremental text deltas using httpx streaming."""
-    inner = [None] * 102
+    inner = [None] * (81 if file_refs else 102)
     if file_refs:
-        refs = [[None, None, ref] for ref in file_refs]
+        refs = [_normalise_file_ref(ref) for ref in file_refs]
         inner[0] = [prompt, 0, None, refs, None, None, 0]
     else:
         inner[0] = [prompt, 0, None, None, None, None, 0]
@@ -629,6 +642,8 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
     inner[61] = []
     inner[68] = 1
     inner[79] = model_id
+    if file_refs:
+        inner[80] = 1
     if extra_fields:
         for k, v in extra_fields.items():
             inner[k] = v
