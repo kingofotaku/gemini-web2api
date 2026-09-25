@@ -247,25 +247,29 @@ def upstream_echo(raw: str):
     return None
 
 
-def check_routing(raw: str, family: int, variant: int = 1):
-    """Warn (and return the message) when upstream served a different model.
+def check_routing(raw: str, family: int, variant: int = 1) -> bool:
+    """Return True when upstream served a different model than requested.
 
     A mismatch means the ticket was ignored — an expired/wrong model key, or
     exhausted quota for that family — and the account default answered instead.
+    Upstream does this randomly (~15-30% of Pro requests even with a fresh
+    ticket), so callers must treat it as retryable rather than fatal.
     """
     echo = upstream_echo(raw)
     if not echo:
-        return None
+        return False
     label, got_family, got_variant = echo
+    if got_family is None:
+        # Frame carried no echo metadata; nothing to compare against.
+        return False
     if got_family == family and got_variant == variant:
-        return None
-    message = (
+        return False
+    log(
         f"Routing mismatch: requested family={family} variant={variant} but "
         f"upstream served {label!r} (family={got_family} variant={got_variant}); "
-        f"check CONFIG['model_keys'] (expired key or exhausted quota)"
+        f"retrying with a fresh ticket",
     )
-    log(message)
-    return message
+    return True
 
 
 # ─── Utilities ───────────────────────────────────────────────────────────────
@@ -598,7 +602,15 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
-            check_routing(raw, model_id, _variant_of(extra_fields))
+            if check_routing(raw, model_id, _variant_of(extra_fields)):
+                # Upstream randomly ignores the ticket; a fresh one usually
+                # routes. Retry instead of silently answering with the default.
+                last_err = RuntimeError(
+                    f"routing mismatch: upstream ignored the model ticket for family={model_id}")
+                if attempt < CONFIG["retry_attempts"] - 1:
+                    time.sleep(CONFIG["retry_delay_sec"])
+                    continue
+                raise last_err
             # Persistent chat: capture c_/r_ ids from the raw response so the
             # next request continues this conversation (prefix KV cache reuse).
             if CONFIG.get("persistent_chat", False):
@@ -700,6 +712,8 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
     routing_checked = False
     transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
     with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True) as client:
+      for stream_attempt in range(CONFIG["retry_attempts"]):
+        routing_checked = False
         try:
             url, body, headers = build_stream_request()
             with client.stream("POST", url, content=body, headers=headers) as resp:
@@ -728,11 +742,13 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                                 routing_checked = True
                                 served = (inner2[42], inner2[58], inner2[59])
                                 if served[1] != model_id or served[2] != _variant_of(extra_fields):
-                                    log(
-                                        f"Routing mismatch: requested family={model_id} "
+                                    # Nothing has been emitted yet (this is the
+                                    # first frame), so a retry with a fresh
+                                    # ticket is safe and almost always routes.
+                                    raise RuntimeError(
+                                        f"routing mismatch: requested family={model_id} "
                                         f"variant={_variant_of(extra_fields)} but upstream served "
-                                        f"{served[0]!r} (family={served[1]} variant={served[2]}); "
-                                        f"check CONFIG['model_keys'] (expired key or exhausted quota)"
+                                        f"{served[0]!r} (family={served[1]} variant={served[2]})"
                                     )
                             # Persistent chat: capture conv_id (c_xxx) and
                             # response id (r_xxx) so the next request can
@@ -758,10 +774,19 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                                                 prev_text = t
                         except (json.JSONDecodeError, IndexError, TypeError):
                             pass
+            return
         except Exception as e:
             # Hard upstream rejections (BardErrorInfo) - retrying is futile,
             # except 1013 which is transient per upstream behavior
             if "Gemini upstream error" in str(e) and "[1013]" not in str(e):
+                raise
+            if "routing mismatch" in str(e) and not prev_text:
+                # Ticket was ignored. A fresh ticket routes most of the time;
+                # retry while nothing has been emitted yet.
+                log(f"{e}; retrying with a fresh ticket")
+                if stream_attempt < CONFIG["retry_attempts"] - 1:
+                    time.sleep(CONFIG["retry_delay_sec"])
+                    continue
                 raise
             status = getattr(getattr(e, "response", None), "status_code", 0)
             if HAS_HTTPX and status in (400, 405) and not prev_text and update_bl_if_needed():

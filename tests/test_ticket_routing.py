@@ -100,11 +100,11 @@ class EchoTests(unittest.TestCase):
         self.assertIsNone(upstream_echo("nothing here"))
 
     def test_check_routing_accepts_matching_family(self):
-        self.assertIsNone(check_routing(self._wrb("3.1 Pro", 3, 1), 3, 1))
+        self.assertFalse(check_routing(self._wrb("3.1 Pro", 3, 1), 3, 1))
 
     def test_check_routing_flags_silent_fallback(self):
-        # 无 ticket 时上游回落账号默认（family 6）——必须能被检测到
-        self.assertIn("mismatch", check_routing(self._wrb("3.5 Flash-Lite", 6, 1), 3, 1).lower())
+        # 无 ticket 时上游回落账号默认（family 6）——必须能被检测到并触发重试
+        self.assertTrue(check_routing(self._wrb("3.5 Flash-Lite", 6, 1), 3, 1))
 
 
 if __name__ == "__main__":

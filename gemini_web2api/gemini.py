@@ -282,25 +282,29 @@ def upstream_echo(raw: str):
     return None
 
 
-def check_routing(raw: str, family: int, variant: int = 1):
-    """Warn (and return the message) when upstream served a different model.
+def check_routing(raw: str, family: int, variant: int = 1) -> bool:
+    """Return True when upstream served a different model than requested.
 
     A mismatch means the ticket was ignored — an expired/wrong model key, or
     exhausted quota for that family — and the account default answered instead.
+    Upstream does this randomly even with a fresh ticket, so callers treat it
+    as retryable rather than fatal.
     """
     echo = upstream_echo(raw)
     if not echo:
-        return None
+        return False
     label, got_family, got_variant = echo
+    if got_family is None:
+        # Frame carried no echo metadata; nothing to compare against.
+        return False
     if got_family == family and got_variant == variant:
-        return None
-    message = (
+        return False
+    log(
         f"Routing mismatch: requested family={family} variant={variant} but "
         f"upstream served {label!r} (family={got_family} variant={got_variant}); "
-        f"check CONFIG['model_keys'] (expired key or exhausted quota)"
+        f"retrying with a fresh ticket",
     )
-    log(message)
-    return message
+    return True
 
 
 def _image_model_headers(page_tokens: dict, session_uuid: str = None) -> dict:
@@ -734,7 +738,15 @@ def _generate_raw(prompt: str, model_id: int, think_mode: int, file_refs: list =
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
-            check_routing(raw, model_id, _variant_of(extra_fields))
+            if check_routing(raw, model_id, _variant_of(extra_fields)):
+                # Upstream randomly ignores the ticket; a fresh one usually
+                # routes. Retry instead of silently answering with the default.
+                last_err = RuntimeError(
+                    f"routing mismatch: upstream ignored the model ticket for family={model_id}")
+                if attempt < CONFIG["retry_attempts"] - 1:
+                    time.sleep(CONFIG["retry_delay_sec"])
+                    continue
+                raise last_err
             return raw
         except urllib.error.HTTPError as e:
             if e.code == 429:
@@ -778,22 +790,24 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             yield text
         return
 
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
-    url = _get_url()
-    headers = _build_headers(family=model_id, variant=_variant_of(extra_fields))
     client = _get_httpx_client()
 
     last_err = None
     emitted_raw_text = ""
     for attempt in range(CONFIG["retry_attempts"]):
         try:
+            # Rebuilt every attempt so a retry carries a fresh model ticket.
+            body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
+            url = _get_url()
+            headers = _build_headers(family=model_id, variant=_variant_of(extra_fields))
+            routing_checked = False
             with client.stream("POST", url, content=body, headers=headers) as resp:
                 resp.raise_for_status()
                 buf = ""
                 for chunk in resp.iter_text():
                     buf += chunk
                     if "BardErrorInfo" in buf:
-                        bard_err = re.search(r'BardErrorInfo"?,?\s*\[(\d+)\]', buf)
+                        bard_err = re.search(r'BardErrorInfo\"?,?\s*\[(\d+)\]', buf)
                         if bard_err:
                             raise _upstream_error(int(bard_err.group(1)))
                     while "\n" in buf:
@@ -801,6 +815,19 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                         bard_error_code = _bard_error_code(line)
                         if bard_error_code is not None:
                             raise _upstream_error(bard_error_code)
+                        # The echo metadata (which model actually answered) is
+                        # only in the first frame, before any text is emitted.
+                        if not routing_checked and '"wrb.fr"' in line:
+                            echo = upstream_echo(line + "\n" + "x" * 250)
+                            routing_checked = True
+                            if (echo and echo[1] is not None
+                                    and (echo[1] != model_id or echo[2] != _variant_of(extra_fields))):
+                                # Ticket was ignored; nothing has been emitted
+                                # yet, so retrying with a fresh one is safe.
+                                raise RuntimeError(
+                                    f"routing mismatch: requested family={model_id} "
+                                    f"variant={_variant_of(extra_fields)} but upstream served "
+                                    f"{echo[0]!r} (family={echo[1]} variant={echo[2]})")
                         for t in _extract_texts_from_line(line):
                             if t == emitted_raw_text or emitted_raw_text.startswith(t):
                                 continue
@@ -821,6 +848,13 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
+            if "routing mismatch" in str(e) and not emitted_raw_text:
+                log(f"{e}; retrying with a fresh ticket")
+                last_err = e
+                if attempt < CONFIG["retry_attempts"] - 1:
+                    time.sleep(CONFIG["retry_delay_sec"])
+                    continue
+                raise
             if emitted_raw_text:
                 # Partial content already streamed: a retry would either fail the
                 # prefix check or splice two different generations together, so end
