@@ -192,7 +192,8 @@ _IMAGE_MODEL_HEADER_KEY = "x-goog-ext-525001261-jspb"
 _IMAGE_MODEL_FALLBACK = ("8c46e95b1a07cecc", "2", 6)
 
 
-def _build_headers(request_uuid: str = None) -> dict:
+def _build_headers(request_uuid: str = None, family: int = None,
+                   variant: int = 1) -> dict:
     account_prefix = _account_prefix()
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -210,6 +211,10 @@ def _build_headers(request_uuid: str = None) -> dict:
         headers["Cookie"] = cookie_str
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
+    if family:
+        ticket = build_model_ticket(family, variant)
+        if ticket:
+            headers[_TICKET_HEADER] = ticket
     return headers
 
 
@@ -224,6 +229,78 @@ def _build_model_headers(model_id: str, capacity_tail: str | int,
         "x-goog-ext-73010989-jspb": "[0]",
         "x-goog-ext-73010990-jspb": "[0,0,0]",
     }
+
+
+# ─── Model-routing ticket (text path) ────────────────────────────────────────
+# The served model is decided by the `x-goog-ext-525001261-jspb` header, NOT by
+# payload slot79: without the header upstream ignores slot79 and serves the
+# account default (silent fallback). The header embeds the (family, variant)
+# it routes on at indices 14/15, and index 4 is a model key that must exist in
+# the account page's id list — the same key serves several families, so the
+# (14,15) pair is what selects Flash vs Pro. Indices 14/15 must equal payload
+# slots 79/80. Verified live 2026-09-25; see issue #82.
+_TICKET_HEADER = "x-goog-ext-525001261-jspb"
+_TICKET_KEY_KIND = {1: "flash", 3: "pro", 6: "lite"}
+
+
+def _variant_of(extra_fields: dict = None) -> int:
+    """Payload variant (slot80); the ticket must repeat it at index 15."""
+    try:
+        return int((extra_fields or {})[80])
+    except (KeyError, TypeError, ValueError):
+        return 1
+
+
+def build_ticket(model_key: str, family: int, variant: int = 1) -> str:
+    """Build the model-routing ticket value for one request."""
+    return json.dumps(
+        [1, None, None, None, model_key, None, None, 0,
+         [4, 5, 6, 8, 4, 5, 6, 8], None, None, 2,
+         None, None, family, variant, str(uuid.uuid4()).upper()],
+        separators=(",", ":"))
+
+
+def build_model_ticket(model_id: int, variant: int = 1):
+    """Ticket for a payload family/variant, or None when no key is configured."""
+    key = (CONFIG.get("model_keys") or {}).get(_TICKET_KEY_KIND.get(model_id))
+    if not key:
+        return None
+    return build_ticket(key, model_id, variant)
+
+
+def upstream_echo(raw: str):
+    """Return (label, family, variant) the backend reports serving, or None."""
+    for line in raw.split("\n"):
+        if '"wrb.fr"' not in line or len(line) < 200:
+            continue
+        try:
+            meta = json.loads(json.loads(line)[0][2])
+        except (json.JSONDecodeError, IndexError, TypeError):
+            continue
+        if isinstance(meta, list) and len(meta) >= 60:
+            return meta[42], meta[58], meta[59]
+    return None
+
+
+def check_routing(raw: str, family: int, variant: int = 1):
+    """Warn (and return the message) when upstream served a different model.
+
+    A mismatch means the ticket was ignored — an expired/wrong model key, or
+    exhausted quota for that family — and the account default answered instead.
+    """
+    echo = upstream_echo(raw)
+    if not echo:
+        return None
+    label, got_family, got_variant = echo
+    if got_family == family and got_variant == variant:
+        return None
+    message = (
+        f"Routing mismatch: requested family={family} variant={variant} but "
+        f"upstream served {label!r} (family={got_family} variant={got_variant}); "
+        f"check CONFIG['model_keys'] (expired key or exhausted quota)"
+    )
+    log(message)
+    return message
 
 
 def _image_model_headers(page_tokens: dict, session_uuid: str = None) -> dict:
@@ -646,7 +723,7 @@ def _generate_raw(prompt: str, model_id: int, think_mode: int, file_refs: list =
             # reflected in the retry request.
             body = _build_payload(prompt, model_id, think_mode, extra_fields=extra_fields).encode()
             url = _get_url()
-            headers = _build_headers()
+            headers = _build_headers(family=model_id, variant=_variant_of(extra_fields))
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             if proxy:
                 opener = urllib.request.build_opener(
@@ -656,7 +733,9 @@ def _generate_raw(prompt: str, model_id: int, think_mode: int, file_refs: list =
                 resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
-            return resp.read().decode("utf-8", errors="replace")
+            raw = resp.read().decode("utf-8", errors="replace")
+            check_routing(raw, model_id, _variant_of(extra_fields))
+            return raw
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 raise RuntimeError("Gemini upstream rate-limited this IP (HTTP 429); retrying immediately would extend the block")
@@ -701,7 +780,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
 
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
     url = _get_url()
-    headers = _build_headers()
+    headers = _build_headers(family=model_id, variant=_variant_of(extra_fields))
     client = _get_httpx_client()
 
     last_err = None

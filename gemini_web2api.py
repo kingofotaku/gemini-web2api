@@ -58,13 +58,15 @@ DEFAULT_CONFIG = {
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     "auth_user": None,
     "xsrf_token": None,
-    "default_model": "gemini-3.6-flash",
+    "default_model": "gemini-3.8-flash",
     "log_requests": True,
     "cookie_file": None,
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
     "persistent_chat": False,
+    # Account-page model ids used by the routing ticket (see build_ticket).
+    "model_keys": {},
 }
 
 # ─── Persistent chat window (for cache reuse) ────────────────────────────────
@@ -179,88 +181,91 @@ except ImportError:
     CONFIG = dict(DEFAULT_CONFIG)
 
 # ─── Models ──────────────────────────────────────────────────────────────────
-# Mapping from JS source: MODE_CATEGORY enum (028-6eb337387583.js)
+# Model routing (verified live 2026-09-25): the served model is decided by the
+# `x-goog-ext-525001261-jspb` header, NOT by payload slot79 — without the header
+# upstream ignores slot79 and serves the account default (silent fallback).
+# The header embeds the (family, variant) it routes on at indices 14/15, and
+# index 4 is a model key that must exist in the account page's id list; the
+# same key serves several families. Indices 14/15 must equal payload slots
+# 79/80. See gemini_web2api/gemini.py:build_ticket and upstream issue #82.
+#
+# MODE_CATEGORY enum from 028-6eb337387583.js:
 #   1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
 
 MODELS = {
     "gemini-3.8-flash": {
-        "mode": 1, "think": 4,
-        "desc": "Latest all-around model (Gemini 3.8 Flash)",
-    },
-    "gemini-3.7-flash": {
-        "mode": 1, "think": 4,
-        "desc": "All-around model (Gemini 3.7 Flash)",
-    },
-    "gemini-3.6-flash": {
-        "mode": 1, "think": 4,
-        "desc": "All-around model (Gemini 3.6 Flash)",
-    },
-    "gemini-3.5-flash": {
-        "mode": 1, "think": 4,
-        "desc": "Alias for gemini-3.6-flash (backend upgraded)",
-    },
-    "gemini-3.5-flash-thinking": {
-        "mode": 2, "think": 0,
-        "desc": "Deep thinking mode, longest output (~20k chars)",
+        "mode": 1, "think": 4, "family": 1, "variant": 1,
+        "desc": "All-around model (Flash family)",
     },
     "gemini-3.1-pro": {
-        "mode": 3, "think": 4,
-        "desc": "Pro model (requires cookie for real routing)",
-    },
-    "gemini-3.1-pro-enhanced": {
-        "mode": 3, "think": 4, "extra": {31: 2, 80: 3},
-        "desc": "Pro with enhanced output (experimental)",
-    },
-    "gemini-auto": {
-        "mode": 4, "think": 4,
-        "desc": "Auto model selection",
-    },
-    "gemini-3.5-flash-thinking-lite": {
-        "mode": 5, "think": 0,
-        "desc": "Dynamic thinking with adaptive depth",
-    },
-    "gemini-flash-lite": {
-        "mode": 6, "think": 4,
-        "desc": "Lightweight fast model",
+        "mode": 3, "think": 4, "family": 3, "variant": 1,
+        "desc": "Pro model (Advanced subscription required)",
     },
 }
 
-# ─── Model selection header (x-goog-ext-525001261-jspb) ─────────────────────
-# Verified internal model IDs (from browser captures, Issue #82).
-# When this header is absent, upstream ignores slot79 and serves the account
-# default model, so model selection silently no-ops. See:
-#   https://github.com/Sophomoresty/gemini-web2api/issues/82
-MODEL_IDS = {
-    "gemini-3.8-flash": "56fdd199312815e2",   # not yet verified separately; 3.7 ID is stable
-    "gemini-3.7-flash": "56fdd199312815e2",   # cat 1 (verified)
-    "gemini-3.6-flash": "56fdd199312815e2",   # alias to 3.7 id for now
-    "gemini-3.5-flash": "56fdd199312815e2",
-    "gemini-3.1-pro": "e6fa609c3fa255c0",     # cat 3 (verified)
-    "gemini-flash-lite": "8c46e95b1a07cecc",  # cat 6 (verified)
-    "gemini-3.5-flash-thinking": "56fdd199312815e2",
-    "gemini-3.5-flash-thinking-lite": "56fdd199312815e2",
-    "gemini-auto": None,                      # no header = account default
-}
+# ─── Model-routing ticket ────────────────────────────────────────────────────
+_TICKET_HEADER = "x-goog-ext-525001261-jspb"
+_TICKET_KEY_KIND = {1: "flash", 3: "pro", 6: "lite"}
 
-def build_model_header(model_name: str, model_id: int) -> Optional[str]:
-    """Build the x-goog-ext-525001261-jspb model-selection header.
 
-    Contract (Issue #82): [1,null,null,null,"<model_id>",null,null,0,
-    [4,5,6,8,4,5,6,8],null,null,2,null,null,<category>,<extended>,"<uuid>"]
-    idx4 = model selector; idx14 must equal payload slot79; idx15 = slot80.
-    Returns None for models without a known internal ID (-> account default).
-    """
-    mid = MODEL_IDS.get(model_name)
-    if not mid:
-        return None
+def _variant_of(extra_fields: dict = None) -> int:
+    """Payload variant (slot80); the ticket must repeat it at index 15."""
     try:
-        return json.dumps(
-            [1, None, None, None, mid, None, None, 0,
-             [4, 5, 6, 8, 4, 5, 6, 8], None, None, 2,
-             None, None, model_id, 0, str(uuid.uuid4())],
-            separators=(",", ":"))
-    except Exception:
+        return int((extra_fields or {})[80])
+    except (KeyError, TypeError, ValueError):
+        return 1
+
+
+def build_ticket(model_key: str, family: int, variant: int = 1) -> str:
+    """Build the model-routing ticket value for one request."""
+    return json.dumps(
+        [1, None, None, None, model_key, None, None, 0,
+         [4, 5, 6, 8, 4, 5, 6, 8], None, None, 2,
+         None, None, family, variant, str(uuid.uuid4()).upper()],
+        separators=(",", ":"))
+
+
+def build_model_ticket(model_id: int, variant: int = 1):
+    """Ticket for a payload family/variant, or None when no key is configured."""
+    key = (CONFIG.get("model_keys") or {}).get(_TICKET_KEY_KIND.get(model_id))
+    if not key:
         return None
+    return build_ticket(key, model_id, variant)
+
+
+def upstream_echo(raw: str):
+    """Return (label, family, variant) the backend reports serving, or None."""
+    for line in raw.split("\n"):
+        if '"wrb.fr"' not in line or len(line) < 200:
+            continue
+        try:
+            meta = json.loads(json.loads(line)[0][2])
+        except (json.JSONDecodeError, IndexError, TypeError):
+            continue
+        if isinstance(meta, list) and len(meta) >= 60:
+            return meta[42], meta[58], meta[59]
+    return None
+
+
+def check_routing(raw: str, family: int, variant: int = 1):
+    """Warn (and return the message) when upstream served a different model.
+
+    A mismatch means the ticket was ignored — an expired/wrong model key, or
+    exhausted quota for that family — and the account default answered instead.
+    """
+    echo = upstream_echo(raw)
+    if not echo:
+        return None
+    label, got_family, got_variant = echo
+    if got_family == family and got_variant == variant:
+        return None
+    message = (
+        f"Routing mismatch: requested family={family} variant={variant} but "
+        f"upstream served {label!r} (family={got_family} variant={got_variant}); "
+        f"check CONFIG['model_keys'] (expired key or exhausted quota)"
+    )
+    log(message)
+    return message
 
 
 # ─── Utilities ───────────────────────────────────────────────────────────────
@@ -573,7 +578,7 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
             headers["Cookie"] = cookie_str
         if sapisid:
             headers["Authorization"] = make_sapisidhash(sapisid)
-        model_hdr = build_model_header(model_name, model_id)
+        model_hdr = build_model_ticket(model_id, _variant_of(extra_fields))
         if model_hdr:
             headers["x-goog-ext-525001261-jspb"] = model_hdr
         return urllib.request.Request(url, data=body, headers=headers, method="POST")
@@ -593,6 +598,7 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
+            check_routing(raw, model_id, _variant_of(extra_fields))
             # Persistent chat: capture c_/r_ ids from the raw response so the
             # next request continues this conversation (prefix KV cache reuse).
             if CONFIG.get("persistent_chat", False):
@@ -675,7 +681,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
             headers["Cookie"] = cookie_str
         if sapisid:
             headers["Authorization"] = make_sapisidhash(sapisid)
-        model_hdr = build_model_header(model_name, model_id)
+        model_hdr = build_model_ticket(model_id, _variant_of(extra_fields))
         if model_hdr:
             headers["x-goog-ext-525001261-jspb"] = model_hdr
         return url, body, headers
@@ -691,6 +697,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
         return
 
     prev_text = ""
+    routing_checked = False
     transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
     with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True) as client:
         try:
@@ -715,6 +722,18 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                             if not inner_str:
                                 continue
                             inner2 = json.loads(inner_str)
+                            # Detect a silently-ignored model ticket on the first
+                            # frame (the echo metadata is only present there).
+                            if routing_checked is False and isinstance(inner2, list) and len(inner2) >= 60:
+                                routing_checked = True
+                                served = (inner2[42], inner2[58], inner2[59])
+                                if served[1] != model_id or served[2] != _variant_of(extra_fields):
+                                    log(
+                                        f"Routing mismatch: requested family={model_id} "
+                                        f"variant={_variant_of(extra_fields)} but upstream served "
+                                        f"{served[0]!r} (family={served[1]} variant={served[2]}); "
+                                        f"check CONFIG['model_keys'] (expired key or exhausted quota)"
+                                    )
                             # Persistent chat: capture conv_id (c_xxx) and
                             # response id (r_xxx) so the next request can
                             # continue this conversation (prefix KV cache).
@@ -1187,7 +1206,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
         cfg = MODELS.get(model_name)
         if not cfg:
             return None, None, None, f"Unknown model: {model_name}", None
-        return model_name, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None, cfg.get("extra")
+        think_mode = think_override if think_override is not None else cfg["think"]
+        # slot80 (variant) must reach both the payload and the ticket's index 15
+        # — the contract ties them together, so it is always carried.
+        extra = dict(cfg.get("extra") or {})
+        extra[80] = cfg.get("variant", 1)
+        return model_name, cfg["mode"], think_mode, None, extra
 
     def _call_gemini(self, prompt, model_id, think_mode, tools, file_refs=None, extra_fields=None, model_name=None):
         raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, extra_fields, model_name)

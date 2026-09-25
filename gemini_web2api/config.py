@@ -17,6 +17,8 @@ DEFAULT_CONFIG = {
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
+    # Account-page model ids used by the routing ticket (see gemini.build_ticket).
+    "model_keys": {},
     # Generated image output only; values above the hard safety caps are ignored.
     "generated_image_max_bytes": 10 * 1024 * 1024,
     "generated_image_max_redirects": 3,
