@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from gemini_web2api.config import CONFIG, load_config  # noqa: E402
 from gemini_web2api.gemini import (  # noqa: E402
-    generate,
+    _generate_raw,
     upstream_echo,
 )
 
@@ -38,7 +38,7 @@ def check(count: int) -> bool:
         ok = 0
         for i in range(count):
             try:
-                raw = generate("reply exactly PONG", family, 4, None, {80: variant})
+                raw = _generate_raw("reply exactly PONG", family, 4, None, {80: variant})
                 echo = upstream_echo(raw)
                 good = bool(echo and echo[1] == family and echo[2] == variant)
                 ok += good
