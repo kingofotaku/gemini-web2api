@@ -27,8 +27,14 @@ class TicketBuildTests(unittest.TestCase):
         self.assertEqual(t[11], 2)                   # browser-capture constant
         self.assertEqual(t[14], 1)                   # family
         self.assertEqual(t[15], 1)                   # variant
-        self.assertEqual(t[8], [4, 5, 6, 8, 4, 5, 6, 8])
+        self.assertEqual(t[8], [4, 5, 6, 8, 16, 4, 5, 6, 8, 16])
         self.assertEqual(len(t[16]), 36)             # fresh UUID, uppercase
+        # Tail: empty list + fresh timestamp, as Google's own requests carry.
+        self.assertEqual(len(t), 20)
+        self.assertEqual(t[17], None)
+        self.assertEqual(t[18], None)
+        self.assertIsInstance(t[19], list)
+        self.assertIsInstance(t[19][1][0], int)
 
     def test_ticket_uuid_is_fresh_per_call(self):
         a = json.loads(build_ticket("fbb127bbb056c959", 1, 1))[16]

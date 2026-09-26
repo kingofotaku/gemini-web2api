@@ -217,11 +217,22 @@ def _variant_of(extra_fields: dict = None) -> int:
 
 
 def build_ticket(model_key: str, family: int, variant: int = 1) -> str:
-    """Build the model-routing ticket value for one request."""
+    """Build the model-routing ticket value for one request.
+
+    Shape taken byte-for-byte from a live browser capture (2026-09-25):
+    [1,null,null,null,<key>,null,null,0,[4,5,6,8,16,4,5,6,8,16],null,null,2,
+     null,null,<family>,<variant>,<UUID>,null,null,[[],[ts,ns]]]
+    The tail carries an empty list plus a fresh timestamp; the UUID is new per
+    request. Previously the feature list was 8 elements with no tail — Google's
+    is 10 plus the tail, and an unknown key makes family 1 answer as 3.6 Flash
+    instead of 3.8, which silently looked like 'the label is stale'.
+    """
+    now = time.time()
     return json.dumps(
         [1, None, None, None, model_key, None, None, 0,
-         [4, 5, 6, 8, 4, 5, 6, 8], None, None, 2,
-         None, None, family, variant, str(uuid.uuid4()).upper()],
+         [4, 5, 6, 8, 16, 4, 5, 6, 8, 16], None, None, 2,
+         None, None, family, variant, str(uuid.uuid4()).upper(),
+         None, None, [[], [int(now), int(now % 1 * 1e9)]]],
         separators=(",", ":"))
 
 

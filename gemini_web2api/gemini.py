@@ -252,11 +252,20 @@ def _variant_of(extra_fields: dict = None) -> int:
 
 
 def build_ticket(model_key: str, family: int, variant: int = 1) -> str:
-    """Build the model-routing ticket value for one request."""
+    """Build the model-routing ticket value for one request.
+
+    Shape taken byte-for-byte from a live browser capture (2026-09-25; see the
+    repo's browser_ground_truth.py): the feature list is ten elements and the
+    tail carries an empty list plus a fresh timestamp. The model key at index 4
+    is what selects the model within its family — a key from a different Flash
+    generation silently serves the older model without any error.
+    """
+    now = time.time()
     return json.dumps(
         [1, None, None, None, model_key, None, None, 0,
-         [4, 5, 6, 8, 4, 5, 6, 8], None, None, 2,
-         None, None, family, variant, str(uuid.uuid4()).upper()],
+         [4, 5, 6, 8, 16, 4, 5, 6, 8, 16], None, None, 2,
+         None, None, family, variant, str(uuid.uuid4()).upper(),
+         None, None, [[], [int(now), int(now % 1 * 1e9)]]],
         separators=(",", ":"))
 
 
