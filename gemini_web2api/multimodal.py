@@ -30,6 +30,7 @@ _REDIRECT_STATUS = {301, 302, 303, 307, 308}
 
 def _get_page_tokens() -> dict:
     """Fetch WIZ_global_data tokens from the configured Gemini account page."""
+    load_cookie()  # may inject auth_user/xsrf/bl from the auth json
     auth_user = CONFIG.get("auth_user")
     account_prefix = _account_prefix()
     headers = {

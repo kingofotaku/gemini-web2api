@@ -367,6 +367,11 @@ def make_sapisidhash(sapisid: str) -> str:
 
 def account_prefix() -> str:
     """Return the Gemini account path prefix for non-default Google accounts."""
+    if not _AUTH_FIELDS_LOADED and CONFIG.get("cookie_file"):
+        # The exported auth json carries auth_user; resolve it here so no
+        # caller can build a request before the account is known (otherwise
+        # the request silently targets account 0 and /app).
+        load_cookie()
     auth_user = CONFIG.get("auth_user")
     if auth_user is None or auth_user == "":
         return ""
@@ -431,7 +436,7 @@ def fetch_latest_bl() -> Optional[str]:
         cookie_str, _ = load_cookie()
         if cookie_str:
             headers["Cookie"] = cookie_str
-        req = urllib.request.Request("https://gemini.google.com/app", headers=headers)
+        req = urllib.request.Request(f"https://gemini.google.com{account_prefix()}/app", headers=headers)
         ctx = ssl.create_default_context()
         proxy = CONFIG.get("proxy")
         if proxy:
@@ -472,11 +477,12 @@ def fetch_xsrf_token() -> Optional[str]:
     or rejected. Returns the raw token string or None on failure.
     """
     try:
+        cookie_str, _ = load_cookie()  # also injects auth_user from an auth file
         req = urllib.request.Request(
-            "https://gemini.google.com/app",
+            f"https://gemini.google.com{account_prefix()}/app",
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Cookie": load_cookie()[0],
+                "Cookie": cookie_str,
             })
         ctx = ssl.create_default_context()
         proxy = CONFIG.get("proxy")
@@ -599,6 +605,10 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
         return urllib.request.Request(url, data=body, headers=headers, method="POST")
 
     last_err = None
+    # load_cookie() injects auth_user/xsrf/bl from the auth json on first call;
+    # prime it so attempt #1 already posts to the right account instead of
+    # burning a 400 on /app.
+    load_cookie()
     for attempt in range(CONFIG["retry_attempts"]):
         try:
             req = build_request()
@@ -721,6 +731,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
 
     prev_text = ""
     routing_checked = False
+    load_cookie()  # inject auth_user/xsrf/bl from the auth json before attempt #1
     transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
     with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True) as client:
       for stream_attempt in range(CONFIG["retry_attempts"]):

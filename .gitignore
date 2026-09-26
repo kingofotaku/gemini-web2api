@@ -10,3 +10,8 @@ gemini-auth.json
 
 cookies.txt
 config_backup.json
+
+# timestamped local backups (keep out of the repo)
+*.bak-*
+server.log
+service.log

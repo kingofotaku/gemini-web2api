@@ -47,6 +47,9 @@ def _next_reqid() -> int:
 
 _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0, "size": -1}
+# Auth metadata (auth_user / xsrf / bl) injects from the exported json only
+# once, so later CONFIG tweaks are not clobbered by the file on every read.
+_auth_fields_loaded = False
 _httpx_client = None
 
 
@@ -113,6 +116,22 @@ def load_cookie() -> tuple:
             data = json.loads(content)
             cookie_str = data.get("cookie", "")
             sapisid = data.get("sapisid", "")
+            global _auth_fields_loaded
+            if not _auth_fields_loaded:
+                # The exported auth json is the authoritative source for which
+                # Google account to talk to (/u/N) and for the page tokens the
+                # account expects; without auth_user every request lands on
+                # /app (account 0) and gets served that account's default model.
+                if data.get("xsrf_token"):
+                    CONFIG["xsrf_token"] = data["xsrf_token"]
+                    log(f"xsrf loaded from auth file (len {len(data['xsrf_token'])})")
+                if data.get("gemini_bl"):
+                    CONFIG["gemini_bl"] = data["gemini_bl"]
+                    log("gemini_bl loaded from auth file")
+                if data.get("auth_user") is not None:
+                    CONFIG["auth_user"] = data["auth_user"]
+                    log(f"auth_user loaded from auth file: {data['auth_user']}")
+                _auth_fields_loaded = True
         elif "# Netscape HTTP Cookie File" in content or content.startswith("#HttpOnly_"):
             # Netscape cookies.txt (tab-separated: domain, flag, path, secure, expiry, name, value)
             pairs = {}
@@ -148,7 +167,15 @@ def refresh_bl_and_xsrf() -> bool:
         cookie_str, _ = load_cookie()
         if cookie_str:
             headers["Cookie"] = cookie_str
-        req = urllib.request.Request("https://gemini.google.com/app", headers=headers)
+        # load_cookie() may have just injected auth_user from the auth json;
+        # the page must be fetched from the same account the requests go to,
+        # otherwise the refreshed xsrf token belongs to the wrong account.
+        account_prefix = _account_prefix()
+        if account_prefix:
+            headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
+            headers["Referer"] = f"https://gemini.google.com{account_prefix}/app"
+        req = urllib.request.Request(
+            f"https://gemini.google.com{account_prefix}/app", headers=headers)
         proxy = CONFIG.get("proxy")
         ctx = _get_ssl_ctx()
         if proxy:
@@ -181,6 +208,11 @@ def make_sapisidhash(sapisid: str) -> str:
 
 def _account_prefix() -> str:
     """Return the Gemini account path prefix for non-default Google accounts."""
+    if not _auth_fields_loaded and CONFIG.get("cookie_file"):
+        # The exported auth json carries auth_user; any caller resolving the
+        # account must not depend on someone else having loaded the cookie
+        # first, or the request silently targets account 0 (/app).
+        load_cookie()
     auth_user = CONFIG.get("auth_user")
     if auth_user is None or auth_user == "":
         return ""
@@ -730,6 +762,10 @@ def _generate_raw(prompt: str, model_id: int, think_mode: int, file_refs: list =
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
     last_err = None
+    # Inject auth-file metadata (auth_user/xsrf/bl) before the first request is
+    # built; otherwise attempt #1 posts to /app with no `at` and only the 400
+    # retry path lands on the right account.
+    load_cookie()
     for attempt in range(CONFIG["retry_attempts"]):
         try:
             # Rebuild body/url/headers every attempt so a BL/XSRF refresh is
@@ -803,6 +839,9 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
 
     last_err = None
     emitted_raw_text = ""
+    # Same reason as _generate_raw: inject auth-file metadata before the first
+    # URL/body is built so attempt #1 already targets the right account.
+    load_cookie()
     for attempt in range(CONFIG["retry_attempts"]):
         try:
             # Rebuilt every attempt so a retry carries a fresh model ticket.
