@@ -450,7 +450,7 @@ def fetch_latest_bl() -> Optional[str]:
         m = re.search(r'"SNlM0e":"([^"]+)"', html)
         if m:
             CONFIG["xsrf_token"] = m.group(1)
-        m = re.search(r'(boq_assistant-bard-web-server_\d+\.\d+_p\d+)', html)
+        m = re.search(r'(boq_[A-Za-z0-9_\-]+_\d+\.\d+_p\d+)', html)
         if m:
             return m.group(1)
     except Exception as e:
