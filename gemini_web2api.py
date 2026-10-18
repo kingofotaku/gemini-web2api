@@ -729,13 +729,24 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
             yield text
         return
 
-    prev_text = ""
     routing_checked = False
     load_cookie()  # inject auth_user/xsrf/bl from the auth json before attempt #1
     transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
-    with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True) as client:
+    # ponytail: per-phase timeouts. A single flat timeout lets a stalled
+    # upstream hold the read phase for the full duration; during streaming the
+    # read timeout is what bounds "how long we wait for the next byte", so it
+    # has to be short enough to fail over quickly.
+    _stream_timeout = httpx.Timeout(
+        CONFIG.get("connect_timeout_sec", 10.0),
+        read=CONFIG.get("stream_read_timeout_sec", 20.0),
+        write=15.0,
+        pool=10.0,
+    )
+    with httpx.Client(transport=transport, timeout=_stream_timeout, verify=True) as client:
       for stream_attempt in range(CONFIG["retry_attempts"]):
         routing_checked = False
+        prev_text = ""      # reset per attempt: a retry must not diff against stale text
+        emitted = False     # whether any delta has reached the client yet
         try:
             url, body, headers = build_stream_request()
             with client.stream("POST", url, content=body, headers=headers) as resp:
@@ -793,6 +804,7 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                                                 delta = clean_gemini_text(delta, strip=False)
                                                 if delta:
                                                     yield delta
+                                                    emitted = True
                                                 prev_text = t
                         except (json.JSONDecodeError, IndexError, TypeError):
                             pass
@@ -818,6 +830,14 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                 if text:
                     yield text
                 return
+            # Nothing reached the client yet, so retrying is invisible to the
+            # caller. Connection-level drops (proxy hiccups, upstream RST) are
+            # the common failure here and usually succeed on the next attempt.
+            if not emitted and stream_attempt < CONFIG["retry_attempts"] - 1:
+                log(f"stream attempt {stream_attempt + 1}/{CONFIG['retry_attempts']} dropped before any "
+                    f"output ({type(e).__name__}: {str(e)[:70]}); retrying")
+                time.sleep(CONFIG["retry_delay_sec"])
+                continue
             raise
 
 
