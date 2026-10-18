@@ -959,13 +959,14 @@ def messages_to_prompt(messages: list, tools: list = None) -> tuple:
                 'read', 'edit', 'write', 'grep', 'glob', 'pwsh',
                 'web_search', 'todo_write', 'todo_read', 'subagent',
             }
-            filtered = []
-            skipped = 0
-            for t in tool_defs:
-                if t.get("name", "") in CORE_TOOL_NAMES:
-                    filtered.append(t)
-                else:
-                    skipped += 1
+            # ponytail: the whitelist is a DSH-specific token-saving hack. Other
+            # clients (Hermes, Cline, Codex-style agents) name their tools
+            # differently, so a zero-match means "not DSH" — pass every tool
+            # through. Filtering them all out hands the model an empty tool list
+            # and it answers by fabricating results instead of calling anything.
+            matched = [t for t in tool_defs if t.get("name", "") in CORE_TOOL_NAMES]
+            filtered = matched if matched else tool_defs
+            skipped = len(tool_defs) - len(filtered)
             if skipped:
                 log(f"Tool filter: {len(tool_defs)} → {len(filtered)} core tools ({skipped} dev/job/goals skipped)")
             MAX_DESC = 150
