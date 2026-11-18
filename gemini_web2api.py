@@ -161,6 +161,21 @@ CHAT_WINDOW = ChatWindow()
 _REQID_LOCK = threading.Lock()
 _REQID_NEXT = random.randrange(10000, 99999)
 
+# ponytail: honour CONFIG["max_concurrency"]. The server is a ThreadingMixIn with
+# no limit, so `max_concurrency` was documented but never enforced — N parallel
+# callers all hit Gemini at once and whichever draws a slow upstream response
+# turns into the 10-30s tail. Lazily created so CONFIG can be loaded first; one
+# process-wide bound is enough because Gemini rate-limits the account globally.
+_CONCURRENCY_GATE = None
+
+
+def _concurrency_gate():
+    global _CONCURRENCY_GATE
+    if _CONCURRENCY_GATE is None:
+        _CONCURRENCY_GATE = threading.BoundedSemaphore(
+            max(1, int(CONFIG.get("max_concurrency", 4))))
+    return _CONCURRENCY_GATE
+
 
 def _next_reqid() -> int:
     global _REQID_NEXT
@@ -731,7 +746,12 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
 
     routing_checked = False
     load_cookie()  # inject auth_user/xsrf/bl from the auth json before attempt #1
-    transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
+    # ponytail: no keep-alive on the streaming path. A proxy that has already
+    # reaped a pooled connection hands us an RST mid-body, which surfaces as
+    # "peer closed connection" / SSL UNEXPECTED_EOF and costs a whole stall.
+    # One extra TLS handshake per request is invisible next to a 20s stall.
+    _no_keepalive = httpx.Limits(max_keepalive_connections=0, max_connections=8)
+    transport = httpx.HTTPTransport(proxy=proxy, limits=_no_keepalive) if proxy else None
     # ponytail: per-phase timeouts. A single flat timeout lets a stalled
     # upstream hold the read phase for the full duration; during streaming the
     # read timeout is what bounds "how long we wait for the next byte", so it
@@ -742,103 +762,112 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
         write=15.0,
         pool=10.0,
     )
-    with httpx.Client(transport=transport, timeout=_stream_timeout, verify=True) as client:
-      for stream_attempt in range(CONFIG["retry_attempts"]):
-        routing_checked = False
-        prev_text = ""      # reset per attempt: a retry must not diff against stale text
-        emitted = False     # whether any delta has reached the client yet
-        try:
-            url, body, headers = build_stream_request()
-            with client.stream("POST", url, content=body, headers=headers) as resp:
-                resp.raise_for_status()
-                buf = ""
-                for chunk in resp.iter_text():
-                    buf += chunk
-                    if "BardErrorInfo" in buf:
-                        import re as _re
-                        m = _re.search(r'BardErrorInfo"?,?\s*\[(\d+)\]', buf)
-                        if m:
-                            raise RuntimeError(f"Gemini upstream error [{m.group(1)}]")
-                    while "\n" in buf:
-                        line, buf = buf.split("\n", 1)
-                        if '"wrb.fr"' not in line:
-                            continue
-                        try:
-                            arr = json.loads(line)
-                            inner_str = arr[0][2]
-                            if not inner_str:
-                                continue
-                            inner2 = json.loads(inner_str)
-                            # Detect a silently-ignored model ticket on the first
-                            # frame (the echo metadata is only present there).
-                            if routing_checked is False and isinstance(inner2, list) and len(inner2) >= 60:
-                                routing_checked = True
-                                served = (inner2[42], inner2[58], inner2[59])
-                                if served[1] != model_id or served[2] != _variant_of(extra_fields):
-                                    # Nothing has been emitted yet (this is the
-                                    # first frame), so a retry with a fresh
-                                    # ticket is safe and almost always routes.
-                                    raise RuntimeError(
-                                        f"routing mismatch: requested family={model_id} "
-                                        f"variant={_variant_of(extra_fields)} but upstream served "
-                                        f"{served[0]!r} (family={served[1]} variant={served[2]})"
-                                    )
-                            # Persistent chat: capture conv_id (c_xxx) and
-                            # response id (r_xxx) so the next request can
-                            # continue this conversation (prefix KV cache).
-                            if CONFIG.get("persistent_chat", False) and isinstance(inner2, list) and len(inner2) > 1 and isinstance(inner2[1], list):
-                                try:
-                                    _c = inner2[1][0] if len(inner2[1]) > 0 else None
-                                    _r = inner2[1][1] if len(inner2[1]) > 1 else None
-                                    if (isinstance(_c, str) and _c.startswith("c_")) or (isinstance(_r, str) and _r.startswith("r_")):
-                                        CHAT_WINDOW.update_from_response(_c if isinstance(_c, str) and _c.startswith("c_") else None,
-                                                                         _r if isinstance(_r, str) and _r.startswith("r_") else None)
-                                except Exception:
-                                    pass
-                            if isinstance(inner2, list) and len(inner2) > 4 and inner2[4]:
-                                for part in inner2[4]:
-                                    if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
-                                        for t in part[1]:
-                                            if isinstance(t, str) and len(t) > len(prev_text):
-                                                delta = t[len(prev_text):]
-                                                delta = clean_gemini_text(delta, strip=False)
-                                                if delta:
-                                                    yield delta
-                                                    emitted = True
-                                                prev_text = t
-                        except (json.JSONDecodeError, IndexError, TypeError):
-                            pass
-            return
-        except Exception as e:
-            # Hard upstream rejections (BardErrorInfo) - retrying is futile,
-            # except 1013 which is transient per upstream behavior
-            if "Gemini upstream error" in str(e) and "[1013]" not in str(e):
-                raise
-            if "routing mismatch" in str(e) and not prev_text:
-                # Ticket was ignored. A fresh ticket routes most of the time;
-                # retry while nothing has been emitted yet.
-                log(f"{e}; retrying with a fresh ticket")
-                if stream_attempt < CONFIG["retry_attempts"] - 1:
-                    time.sleep(CONFIG["retry_delay_sec"])
-                    continue
-                raise
-            status = getattr(getattr(e, "response", None), "status_code", 0)
-            if HAS_HTTPX and status in (400, 405) and not prev_text and update_bl_if_needed():
-                log("BL/XSRF refreshed, falling back to non-streaming for this request")
-                raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, extra_fields, model_name)
-                text = extract_response_text(raw)
-                if text:
-                    yield text
-                return
-            # Nothing reached the client yet, so retrying is invisible to the
-            # caller. Connection-level drops (proxy hiccups, upstream RST) are
-            # the common failure here and usually succeed on the next attempt.
-            if not emitted and stream_attempt < CONFIG["retry_attempts"] - 1:
-                log(f"stream attempt {stream_attempt + 1}/{CONFIG['retry_attempts']} dropped before any "
-                    f"output ({type(e).__name__}: {str(e)[:70]}); retrying")
-                time.sleep(CONFIG["retry_delay_sec"])
-                continue
-            raise
+    # ponytail: queue here so surplus requests wait locally instead of all
+    # racing Gemini; the read timeout only bounds each request once admitted.
+    _gate = _concurrency_gate()
+    _gate.acquire()
+    try:
+        with httpx.Client(transport=transport, timeout=_stream_timeout, verify=True) as client:
+            for stream_attempt in range(CONFIG["retry_attempts"]):
+              routing_checked = False
+              prev_text = ""      # reset per attempt: a retry must not diff against stale text
+              emitted = False     # whether any delta has reached the client yet
+              try:
+                  url, body, headers = build_stream_request()
+                  with client.stream("POST", url, content=body, headers=headers) as resp:
+                      resp.raise_for_status()
+                      buf = ""
+                      for chunk in resp.iter_text():
+                          buf += chunk
+                          if "BardErrorInfo" in buf:
+                              import re as _re
+                              m = _re.search(r'BardErrorInfo"?,?\s*\[(\d+)\]', buf)
+                              if m:
+                                  raise RuntimeError(f"Gemini upstream error [{m.group(1)}]")
+                          while "\n" in buf:
+                              line, buf = buf.split("\n", 1)
+                              if '"wrb.fr"' not in line:
+                                  continue
+                              try:
+                                  arr = json.loads(line)
+                                  inner_str = arr[0][2]
+                                  if not inner_str:
+                                      continue
+                                  inner2 = json.loads(inner_str)
+                                  # Detect a silently-ignored model ticket on the first
+                                  # frame (the echo metadata is only present there).
+                                  if routing_checked is False and isinstance(inner2, list) and len(inner2) >= 60:
+                                      routing_checked = True
+                                      served = (inner2[42], inner2[58], inner2[59])
+                                      if served[1] != model_id or served[2] != _variant_of(extra_fields):
+                                          # Nothing has been emitted yet (this is the
+                                          # first frame), so a retry with a fresh
+                                          # ticket is safe and almost always routes.
+                                          raise RuntimeError(
+                                              f"routing mismatch: requested family={model_id} "
+                                              f"variant={_variant_of(extra_fields)} but upstream served "
+                                              f"{served[0]!r} (family={served[1]} variant={served[2]})"
+                                          )
+                                  # Persistent chat: capture conv_id (c_xxx) and
+                                  # response id (r_xxx) so the next request can
+                                  # continue this conversation (prefix KV cache).
+                                  if CONFIG.get("persistent_chat", False) and isinstance(inner2, list) and len(inner2) > 1 and isinstance(inner2[1], list):
+                                      try:
+                                          _c = inner2[1][0] if len(inner2[1]) > 0 else None
+                                          _r = inner2[1][1] if len(inner2[1]) > 1 else None
+                                          if (isinstance(_c, str) and _c.startswith("c_")) or (isinstance(_r, str) and _r.startswith("r_")):
+                                              CHAT_WINDOW.update_from_response(_c if isinstance(_c, str) and _c.startswith("c_") else None,
+                                                                               _r if isinstance(_r, str) and _r.startswith("r_") else None)
+                                      except Exception:
+                                          pass
+                                  if isinstance(inner2, list) and len(inner2) > 4 and inner2[4]:
+                                      for part in inner2[4]:
+                                          if isinstance(part, list) and len(part) > 1 and part[1] and isinstance(part[1], list):
+                                              for t in part[1]:
+                                                  if isinstance(t, str) and len(t) > len(prev_text):
+                                                      delta = t[len(prev_text):]
+                                                      delta = clean_gemini_text(delta, strip=False)
+                                                      if delta:
+                                                          yield delta
+                                                          emitted = True
+                                                      prev_text = t
+                              except (json.JSONDecodeError, IndexError, TypeError):
+                                  pass
+                  return
+              except Exception as e:
+                  # Hard upstream rejections (BardErrorInfo) - retrying is futile,
+                  # except 1013 which is transient per upstream behavior
+                  if "Gemini upstream error" in str(e) and "[1013]" not in str(e):
+                      raise
+                  if "routing mismatch" in str(e) and not prev_text:
+                      # Ticket was ignored. A fresh ticket routes most of the time;
+                      # retry while nothing has been emitted yet.
+                      log(f"{e}; retrying with a fresh ticket")
+                      if stream_attempt < CONFIG["retry_attempts"] - 1:
+                          time.sleep(CONFIG["retry_delay_sec"])
+                          continue
+                      raise
+                  status = getattr(getattr(e, "response", None), "status_code", 0)
+                  if HAS_HTTPX and status in (400, 405) and not prev_text and update_bl_if_needed():
+                      log("BL/XSRF refreshed, falling back to non-streaming for this request")
+                      raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs, extra_fields, model_name)
+                      text = extract_response_text(raw)
+                      if text:
+                          yield text
+                      return
+                  # Nothing reached the client yet, so retrying is invisible to the
+                  # caller. Connection-level drops (proxy hiccups, upstream RST) are
+                  # the common failure here and usually succeed on the next attempt.
+                  if not emitted and stream_attempt < CONFIG["retry_attempts"] - 1:
+                      log(f"stream attempt {stream_attempt + 1}/{CONFIG['retry_attempts']} dropped before any "
+                          f"output ({type(e).__name__}: {str(e)[:70]}); retrying")
+                      time.sleep(CONFIG["retry_delay_sec"])
+                      continue
+                  raise
+
+
+    finally:
+        _gate.release()
 
 
 def clean_gemini_text(text: str, strip: bool = True) -> str:
